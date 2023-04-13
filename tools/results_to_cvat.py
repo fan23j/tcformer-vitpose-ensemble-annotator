@@ -56,14 +56,14 @@ def json_to_cvat(args):
         image_node.set('name', image['file_name'])
         
         # add bbox
-#         bbox = annotation['cvat_bbox']
-#         box_node = etree.SubElement(image_node, 'box')
-#         box_node.set('label', 'person')
-#         box_node.set('occluded', "2")
-#         box_node.set('xtl', str(bbox[0]))
-#         box_node.set('ytl', str(bbox[1]))
-#         box_node.set('xbr', str(bbox[2]))
-#         box_node.set('ybr', str(bbox[3]))
+        bbox = annotation['cvat_bbox']
+        box_node = etree.SubElement(image_node, 'box')
+        box_node.set('label', 'person')
+        box_node.set('occluded', "2")
+        box_node.set('xtl', str(bbox[0]))
+        box_node.set('ytl', str(bbox[1]))
+        box_node.set('xbr', str(bbox[2]))
+        box_node.set('ybr', str(bbox[3]))
         
         count = 0
         
