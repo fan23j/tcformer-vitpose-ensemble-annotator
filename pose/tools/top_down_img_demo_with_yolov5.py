@@ -1,0 +1,239 @@
+# Copyright (c) OpenMMLab. All rights reserved.
+import mimetypes
+import os
+import tempfile
+from argparse import ArgumentParser
+
+import json_tricks as json
+import mmcv
+import mmengine
+import numpy as np
+from tqdm import tqdm
+import torch
+import pudb
+from mmcv import Config
+from mmcv.runner import get_dist_info, init_dist, load_checkpoint
+from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
+
+from mmpose.apis import (inference_top_down_pose_model, init_pose_model, vis_pose_result)
+from mmpose.models import build_posenet
+import tcformer
+
+def process_ensemble_output(tcformer_results, vitpose_results):
+    """Process outputs of ensemble models.
+    Takes the keypoint with higher confidence between the two models.
+    """
+    #init empty results
+    result = []
+    
+    # init counters
+    tc_count = 0
+    vit_count = 0
+    
+    # keep keypoint triplet with higher score
+    for tc, vit in zip(tcformer_results, vitpose_results):
+        merged_keypoints = []
+        SCORE = 2
+        for kp1, kp2 in zip(tc["keypoints"], vit["keypoints"]):
+            if kp1[SCORE] > kp2[SCORE]:
+                merged_keypoints.append(kp1)
+                tc_count += 1
+            else:
+                merged_keypoints.append(kp2)
+                vit_count += 1
+        result.append({'bbox': tc['bbox'], 'keypoints': merged_keypoints})
+    print(f'Taken from TCFormer: {tc_count}')
+    print(f'Taken from ViTPose: {vit_count}')
+    return result
+    
+def main():
+    """Visualize the demo images.
+    Using yolov5 to detect the human.
+    """
+    parser = ArgumentParser()
+    parser.add_argument('--tcformer-config', help='Config file for TCFormer')
+    parser.add_argument('--tcformer-checkpoint', help='Checkpoint file for TCFormer')
+    parser.add_argument('--vitpose-config', help="Config file for ViTPose")
+    parser.add_argument('--vitpose-checkpoint', help="Checkpoint file for ViTPose")
+    parser.add_argument(
+        '--input', type=str, default='', help='Image/Video file')
+    parser.add_argument(
+        '--show',
+        action='store_true',
+        default=False,
+        help='whether to show img')
+    parser.add_argument(
+        '--out-img-root',
+        type=str,
+        default='',
+        help='root of the output img file. '
+        'Default not saving the visualization images.')
+    parser.add_argument(
+        '--save-predictions',
+        action='store_true',
+        default=False,
+        help='whether to save predicted results')
+    parser.add_argument(
+        '--device', default='cuda:0', help='Device used for inference')
+    parser.add_argument(
+        '--det-cat-id',
+        type=int,
+        default=0,
+        help='Category id for bounding box detection model')
+    parser.add_argument(
+        '--bbox-thr',
+        type=float,
+        default=0.3,
+        help='Bounding box score threshold')
+    parser.add_argument(
+        '--nms-thr',
+        type=float,
+        default=0.3,
+        help='IoU threshold for bounding box NMS')
+    parser.add_argument(
+        '--kpt-thr', type=float, default=0.3, help='Keypoint score threshold')
+    parser.add_argument(
+        '--draw-heatmap',
+        action='store_true',
+        default=False,
+        help='Draw heatmap predicted by the model')
+    parser.add_argument(
+        '--show-kpt-idx',
+        action='store_true',
+        default=False,
+        help='Whether to show the index of keypoints')
+    parser.add_argument(
+        '--radius',
+        type=int,
+        default=3,
+        help='Keypoint radius for visualization')
+    parser.add_argument(
+        '--thickness',
+        type=int,
+        default=1,
+        help='Link thickness for visualization')
+    parser.add_argument(
+        '--draw-bbox', action='store_true', help='Draw bboxes of instances')
+    parser.add_argument(
+        '--img-root', default="")
+
+    args = parser.parse_args()
+    
+    # builds configs
+    tc_cfg = Config.fromfile(args.tcformer_config)
+    vit_cfg = Config.fromfile(args.vitpose_config)
+
+    assert args.show or (args.out_img_root != '')
+    if args.out_img_root:
+        mmengine.mkdir_or_exist(args.out_img_root)
+    if args.save_predictions:
+        assert args.out_img_root != ''
+        args.pred_save_path = f'{args.out_img_root}/results_' \
+            f'{os.path.splitext(os.path.basename(args.input))[0]}.json'
+
+    # build detector
+    detector = torch.hub.load("ultralytics/yolov5", 'yolov5l6')
+
+    # build the TCFormer model and load checkpoint
+    tcformer_model = build_posenet(tc_cfg.model)
+    tcformer_model = MMDataParallel(tcformer_model, device_ids=[0])
+    load_checkpoint(tcformer_model, args.tcformer_checkpoint, map_location='cuda')
+    tcformer_model.cfg = tc_cfg
+    
+    # build the ViTPose model and load checkpoint
+    vitpose_model = init_pose_model(
+        args.vitpose_config, args.vitpose_checkpoint, device=args.device.lower())
+        
+    # initalize results containers
+    pose_results_list = []
+    image_list = []
+    
+    # run detections
+    for img_name in tqdm(os.listdir(args.img_root)):
+        image_path = os.path.join(args.img_root, img_name)
+
+        # test a single image, the resulting box is (x1, y1, x2, y2)
+        try:
+            dets = detector(image_path)
+        except Exception as e:
+            print(e)
+            print(image_path)
+            continue
+        
+        # initialize person detections list
+        person_detections = []
+
+        # process results
+        df = dets.pandas().xyxy[0]
+        df = df[df['name'] == 'person']
+        detections = df.iloc[:, :5].values.tolist()
+        
+        # filter detections results
+        for bbox in detections:
+            if bbox[4] > args.bbox_thr:
+                person_detections.append({'bbox': bbox})
+
+        # optional
+        return_heatmap = False
+
+        # e.g. use ('backbone', ) to return backbone feature
+        output_layer_names = None
+        
+        # TCFormer results
+        tcformer_results, returned_outputs = inference_top_down_pose_model(
+            tcformer_model,
+            image_path,
+            person_detections,
+            bbox_thr=args.bbox_thr,
+            format='xyxy',
+            return_heatmap=return_heatmap,
+            outputs=output_layer_names)
+        
+        # ViTPose results
+        vitpose_results, returned_outputs = inference_top_down_pose_model(
+            vitpose_model,
+            image_path,
+            person_detections,
+            bbox_thr=args.bbox_thr,
+            format='xyxy',
+            return_heatmap=return_heatmap,
+            outputs=output_layer_names)
+
+        if args.out_img_root == '':
+            out_file = None
+        else:
+            os.makedirs(args.out_img_root, exist_ok=True)
+            out_file = os.path.join(args.out_img_root, f'vis_{img_name}')
+            
+        # process the results
+        pose_results = process_ensemble_output(tcformer_results, vitpose_results)
+        
+        # save results
+        pose_results_list.append(pose_results)
+        image_list.append(img_name)
+        
+        # show the results
+        vis_pose_result(
+            tcformer_model,
+            image_path,
+            pose_results,
+            kpt_score_thr=args.kpt_thr,
+            radius=args.radius,
+            thickness=args.thickness,
+            show=args.show,
+            out_file=out_file)
+        
+    # write to xml
+#     output_xml = generate_cvat_xml(image_list, pose_results_list)
+#     with open('output_cvat.xml', 'w') as f:
+#         f.write(output_xml)
+    # write to json
+    results = {}
+    results["images"] = image_list
+    results["annotations"] = pose_results_list
+    
+    with open("results.json", "w") as out:
+        json.dump(results, out)
+
+if __name__ == '__main__':
+    main()
