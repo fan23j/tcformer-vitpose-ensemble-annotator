@@ -11,6 +11,8 @@ git clone https://github.com/fan23j/tcformer-vitpose-ensemble-annotator.git
 cd tcformer-vitpose-ensemble-annotator
 cd mmcv
 MMCV_WITH_OPS=1 pip install -e .
+# RTX 30 series cards use:
+# MMCV_WITH_OPS=1 MMCV_CUDA_ARGS='-gencode=arch=compute_80,code=sm_80' pip install -e .
 cd ..
 pip install -v -e .
 ```
